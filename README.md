@@ -127,37 +127,73 @@ s.teardown()
 | `.teardown()` | Terminate the instance and clean up state. |
 | `.get_pricing_info()` | Return pricing info without launching anything. |
 
+## Parallel Jobs Across Machines
+
+spotrun scales your workload *up* (more CPUs per machine). But when you have many independent jobs -- hyperparameter sweeps, config variations, Monte Carlo runs -- you can also scale *out* by launching multiple spotrun instances at once. Each gets its own spot instance and tears itself down when done.
+
+20 configs that each take 12 hours locally and 2 hours on a cloud instance? Run them all in parallel -- 2 hours total, ~$4.
+
+```bash
+for i in $(seq 1 20); do
+  spotrun launch -w 8 --sync . "python train.py --config configs/run_${i}.yaml" &
+done
+wait
+```
+
+Or with the Python API:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from spotrun import Session
+
+configs = [f"configs/run_{i}.yaml" for i in range(20)]
+
+def run_job(cfg):
+    with Session(workers=8, project_tag=f"sweep-{cfg}") as s:
+        s.sync_project(".")
+        return s.run(f"cd /opt/project && python train.py --config {cfg}")
+
+with ThreadPoolExecutor(max_workers=20) as pool:
+    results = list(pool.map(run_job, configs))
+```
+
+Anywhere you'd parallelize across CPUs, you can now parallelize across machines.
+
 ## Instance Sizing
 
-spotrun picks the smallest instance that fits your workload using the formula:
+spotrun picks the smallest (cheapest) instance with enough physical cores for your workers. The sizing formula accounts for the architectural difference between x86 and ARM:
 
-```
-vCPUs needed = workers * 2 + 2
-```
+| | x86 (c6a) | ARM/Graviton (c6g, c7g) |
+|---|-----------|------------------------|
+| **Threads per core** | 2 (hyperthreading) | 1 (no HT) |
+| **vCPUs needed** | `workers * 2 + 2` | `workers + 2` |
+| **Max workers (64 vCPU)** | 31 | 62 |
 
-The `* 2` accounts for hyperthreading (2 vCPUs per physical core), and `+ 2` reserves capacity for the OS and SSH.
+The `+2` reserves capacity for the OS and SSH.
 
-**Default (x86_64):**
+**x86_64 instances:**
 
-| Instance | vCPUs | Max Workers |
-|----------|-------|-------------|
-| c6a.xlarge | 4 | 1 |
-| c6a.2xlarge | 8 | 3 |
-| c6a.4xlarge | 16 | 7 |
-| c6a.8xlarge | 32 | 15 |
-| c6a.12xlarge | 48 | 23 |
-| c6a.16xlarge | 64 | 31 |
+| Instance | vCPUs | Phys. Cores | Max Workers |
+|----------|-------|-------------|-------------|
+| c6a.xlarge | 4 | 2 | 1 |
+| c6a.2xlarge | 8 | 4 | 3 |
+| c6a.4xlarge | 16 | 8 | 7 |
+| c6a.8xlarge | 32 | 16 | 15 |
+| c6a.12xlarge | 48 | 24 | 23 |
+| c6a.16xlarge | 64 | 32 | 31 |
 
-**With `--arm` (ARM/Graviton):**
+**ARM/Graviton instances** (with `--arm`):
 
-| Instance | vCPUs | Max Workers |
-|----------|-------|-------------|
-| c6g.xlarge | 4 | 1 |
-| c6g.2xlarge | 8 | 3 |
-| c6g.4xlarge | 16 | 7 |
-| c6g.8xlarge / c7g.8xlarge | 32 | 15 |
-| c6g.12xlarge | 48 | 23 |
-| c6g.16xlarge | 64 | 31 |
+| Instance | vCPUs (= Cores) | Max Workers |
+|----------|-----------------|-------------|
+| c6g.xlarge | 4 | 2 |
+| c6g.2xlarge | 8 | 6 |
+| c6g.4xlarge | 16 | 14 |
+| c6g.8xlarge / c7g.8xlarge | 32 | 30 |
+| c6g.12xlarge | 48 | 46 |
+| c6g.16xlarge | 64 | 62 |
+
+When `--arm` is enabled, spotrun considers both architectures and picks the cheapest option that fits. Because ARM instances have 1:1 vCPU-to-core mapping, they often fit your workload at a smaller (cheaper) tier than x86.
 
 Use `spotrun prices --workers N` to see current spot prices, or `spotrun prices --workers N --arm` to compare with ARM instances.
 
