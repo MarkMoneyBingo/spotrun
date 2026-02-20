@@ -34,9 +34,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/markcrosen/spotrun"
-Repository = "https://github.com/markcrosen/spotrun"
-Issues = "https://github.com/markcrosen/spotrun/issues"
+Homepage = "https://github.com/MarkMoneyBingo/spotrun"
+Repository = "https://github.com/MarkMoneyBingo/spotrun"
+Issues = "https://github.com/MarkMoneyBingo/spotrun/issues"
 
 [project.scripts]
 spotrun = "spotrun.cli:app"
