@@ -31,12 +31,14 @@ class Session:
         bootstrap_script: str | None = None,
         requirements_file: str | None = None,
         include_arm: bool = False,
+        no_hyperthreading: bool = False,
     ) -> None:
         self.workers = workers
         self.project_tag = project_tag
         self.bootstrap_script = bootstrap_script
         self.requirements_file = requirements_file
         self.include_arm = include_arm
+        self.no_hyperthreading = no_hyperthreading
 
         # Auto-select cheapest region if none specified
         if region is None and "AWS_REGION" not in os.environ:
@@ -87,6 +89,13 @@ class Session:
             )
 
         # 5. Request spot instance
+        # Graviton/ARM has no hyperthreading — skip CpuOptions for ARM
+        if self.no_hyperthreading and arch != "arm64":
+            threads_per_core = 1
+            core_count = vcpus // 2  # x86: 2 threads per core by default
+        else:
+            threads_per_core = None
+            core_count = None
         with console.status(f"Requesting [bold]{instance_type}[/bold] spot instance..."):
             self._instance_id = self.ec2.request_spot_instance(
                 instance_type=instance_type,
@@ -94,6 +103,8 @@ class Session:
                 key_name=key_name,
                 sg_id=sg_id,
                 project_tag=self.project_tag,
+                threads_per_core=threads_per_core,
+                core_count=core_count,
             )
             console.print(f"Instance: [bold]{self._instance_id}[/bold]")
 

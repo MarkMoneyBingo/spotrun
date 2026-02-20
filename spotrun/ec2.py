@@ -179,9 +179,20 @@ class EC2Manager:
         sg_id: str,
         user_data: str = "",
         project_tag: str = "spotrun",
+        threads_per_core: int | None = None,
+        core_count: int | None = None,
     ) -> str:
-        """Launch a single spot instance. Returns instance_id."""
-        resp = self.client.run_instances(
+        """Launch a single spot instance. Returns instance_id.
+
+        Args:
+            threads_per_core: If set to 1, disables hyperthreading so each vCPU
+                maps to a physical core. Ideal for CPU-bound single-threaded
+                workloads (e.g. Python multiprocessing). Default None (use
+                instance default, typically 2).
+            core_count: Number of physical cores. Required when threads_per_core
+                is set (AWS requires both CoreCount and ThreadsPerCore).
+        """
+        kwargs: dict = dict(
             ImageId=ami_id,
             InstanceType=instance_type,
             KeyName=key_name,
@@ -201,6 +212,12 @@ class EC2Manager:
                 ],
             }],
         )
+        if threads_per_core is not None and core_count is not None:
+            kwargs["CpuOptions"] = {
+                "CoreCount": core_count,
+                "ThreadsPerCore": threads_per_core,
+            }
+        resp = self.client.run_instances(**kwargs)
         instance_id = resp["Instances"][0]["InstanceId"]
         return instance_id
 

@@ -29,6 +29,7 @@ def launch(
     bootstrap: Optional[str] = typer.Option(None, "--bootstrap", help="Path to custom bootstrap script"),
     requirements: Optional[str] = typer.Option(None, "--requirements", "-r", help="Path to requirements.txt"),
     arm: bool = typer.Option(False, "--arm", help="Include ARM/Graviton instances (cheaper but may have compatibility issues)"),
+    no_ht: bool = typer.Option(False, "--no-ht", help="Disable hyperthreading (1 thread per core). Best for CPU-bound single-threaded workloads like Python multiprocessing"),
 ) -> None:
     """Launch a spot instance, optionally sync files and run a command."""
     session = Session(
@@ -37,6 +38,7 @@ def launch(
         bootstrap_script=bootstrap,
         requirements_file=requirements,
         include_arm=arm,
+        no_hyperthreading=no_ht,
     )
     should_teardown = True
 

@@ -78,6 +78,7 @@ spotrun teardown
 | `--sync, -s` | Local paths to rsync to `/opt/project` on the instance. Repeatable. |
 | `--ssh` | Drop into an interactive SSH session instead of running a command. |
 | `--arm` | Include ARM/Graviton instances (often 20-40% cheaper, see below). |
+| `--no-ht` | Disable hyperthreading (x86 only). Best for CPU-bound workloads. See [CPU Options](#cpu-options). |
 | `--tag` | Project tag for AWS resources (default: `spotrun`). |
 | `--bootstrap` | Path to a custom bootstrap script (replaces the default). |
 | `--requirements, -r` | Path to `requirements.txt` to pre-install in the AMI. |
@@ -117,7 +118,7 @@ s.teardown()
 
 | Method | Description |
 |--------|-------------|
-| `Session(workers, region, project_tag, include_arm)` | Create a session. `workers` determines instance size. `include_arm=True` enables ARM/Graviton. |
+| `Session(workers, region, project_tag, include_arm, no_hyperthreading)` | Create a session. `workers` determines instance size. `include_arm=True` enables ARM/Graviton. `no_hyperthreading=True` disables HT on x86 (see [CPU Options](#cpu-options)). |
 | `.launch()` | Provision infra, find/build AMI, launch spot instance. Returns public IP. |
 | `.sync(paths)` | Rsync individual files/directories to the instance. |
 | `.sync_project(root, excludes)` | Rsync an entire project directory with sensible defaults. |
@@ -175,6 +176,39 @@ Session(workers=8, include_arm=True)
 ```
 
 When ARM is enabled, spotrun considers both x86 and ARM instances and picks the cheapest option. If your workload is pure Python (no native C extensions), ARM is usually a safe and cheaper choice.
+
+## CPU Options
+
+### Disabling Hyperthreading (`--no-ht`)
+
+x86 instances use hyperthreading by default: each physical CPU core exposes 2 vCPUs (threads). This is great for I/O-bound or multi-threaded workloads, but **CPU-bound single-threaded workloads** (like Python multiprocessing) can't benefit from the second thread. Each Python process is bound by the GIL, so it can only use 1 thread per core -- the second vCPU on that core sits mostly idle.
+
+The result: your instance looks ~50% utilized even when every worker is maxed out.
+
+The `--no-ht` flag tells EC2 to disable hyperthreading via [`CpuOptions`](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-optimize-cpu.html), setting `ThreadsPerCore=1`. Each vCPU then maps to a dedicated physical core, so `os.cpu_count()` accurately reflects usable cores and CPU utilization shows real usage.
+
+```bash
+# CLI
+spotrun launch --workers 15 --no-ht "python optimize.py"
+
+# Python API
+Session(workers=15, no_hyperthreading=True)
+```
+
+Same instance, same price -- you just get accurate core counts and eliminate HT contention for CPU-bound work.
+
+### ARM/Graviton and `--no-ht`
+
+ARM/Graviton instances (c6g, c7g) **do not have hyperthreading**. Each vCPU is already a dedicated physical core. AWS does not allow modifying `ThreadsPerCore` on Graviton instances -- the API will reject the request.
+
+spotrun handles this automatically: when `--no-ht` is set but the selected instance is ARM, spotrun skips the `CpuOptions` setting entirely (since Graviton already behaves as if HT is disabled). No error, no wasted cores.
+
+This means you can safely use `--no-ht` together with `--arm` -- spotrun does the right thing regardless of which architecture gets selected:
+
+| Architecture | `--no-ht` behavior |
+|-------------|-------------------|
+| x86 (c6a) | Sets `ThreadsPerCore=1`, halving visible vCPUs to physical core count |
+| ARM (c6g/c7g) | No-op (Graviton already has 1 thread per core) |
 
 ## Automatic Region Selection
 
