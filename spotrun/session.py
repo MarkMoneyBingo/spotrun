@@ -32,9 +32,11 @@ class Session:
         requirements_file: str | None = None,
         include_arm: bool = False,
         no_hyperthreading: bool = False,
+        save_state: bool = True,
     ) -> None:
         self.workers = workers
         self.project_tag = project_tag
+        self._save_state_enabled = save_state
         self.bootstrap_script = bootstrap_script
         self.requirements_file = requirements_file
         self.include_arm = include_arm
@@ -56,8 +58,18 @@ class Session:
         self,
         bootstrap_script: str | None = None,
         requirements_file: str | None = None,
+        idle_timeout: int = 300,
     ) -> str:
-        """Provision infrastructure and launch a spot instance. Returns public IP."""
+        """Provision infrastructure and launch a spot instance. Returns public IP.
+
+        Args:
+            bootstrap_script: Path to a shell script to run during AMI build.
+            requirements_file: Path to requirements.txt to pre-install in AMI.
+            idle_timeout: Seconds of inactivity before auto-terminating the
+                instance.  Inactivity means no active SSH connections (including
+                non-PTY / quiet-mode sessions).  Defaults to 300 (5 minutes).
+                Set to 0 to disable.
+        """
         bootstrap_script = bootstrap_script or self.bootstrap_script
         requirements_file = requirements_file or self.requirements_file
 
@@ -131,6 +143,10 @@ class Session:
         # Update state with IP now that instance is running
         self._save_state(key_name, sg_id)
 
+        # Install idle watchdog (on by default — shuts down after inactivity)
+        if idle_timeout and idle_timeout > 0:
+            self._install_idle_watchdog(idle_timeout)
+
         console.print("[green bold]Instance ready.[/green bold]")
         return self._ip
 
@@ -152,11 +168,15 @@ class Session:
             raise RuntimeError("No active session. Call launch() first.")
         self._sync.rsync_project(local_root, remote_root, excludes=excludes)
 
-    def run(self, command: str) -> int:
-        """Run a command on the remote instance. Returns exit code."""
+    def run(self, command: str, quiet: bool = False, stop_event=None) -> int:
+        """Run a command on the remote instance. Returns exit code.
+
+        If stop_event (threading.Event) is provided and quiet=True, the SSH
+        process will be polled so it can be interrupted when the event is set.
+        """
         if not self._sync:
             raise RuntimeError("No active session. Call launch() first.")
-        result = self._sync.ssh_run(command)
+        result = self._sync.ssh_run(command, quiet=quiet, stop_event=stop_event)
         assert isinstance(result, int)
         return result
 
@@ -198,6 +218,25 @@ class Session:
 
     # -- Internal --
 
+    def _install_idle_watchdog(self, timeout_seconds: int) -> None:
+        """Install a background watchdog that shuts down the instance after
+        *timeout_seconds* of inactivity.
+
+        Inactivity is defined as: no active SSH connections to the instance.
+        This covers both interactive (PTY) and non-interactive (quiet/command)
+        sessions — any ``sshd`` child process with ``@`` in its name indicates
+        an active connection.
+        """
+        self.run(
+            "nohup bash -c '"
+            f"while true; do sleep {timeout_seconds}; "
+            'if ! pgrep -af "sshd:.*@" > /dev/null; then '
+            "sudo shutdown -h now; "
+            "fi; done"
+            "' >/dev/null 2>&1 &",
+            quiet=True,
+        )
+
     def _show_pricing(
         self,
         instance_type: str,
@@ -228,6 +267,8 @@ class Session:
             )
 
     def _save_state(self, key_name: str, sg_id: str) -> None:
+        if not self._save_state_enabled:
+            return
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         state = {
             "instance_id": self._instance_id,
@@ -246,8 +287,14 @@ class Session:
         with os.fdopen(fd, "w") as f:
             f.write(content)
 
+    def _clear_state(self) -> None:
+        if not self._save_state_enabled:
+            return
+        Session.clear_state_file()
+
     @staticmethod
-    def _clear_state() -> None:
+    def clear_state_file() -> None:
+        """Remove the state file from disk (static — usable without an instance)."""
         if STATE_FILE.exists():
             STATE_FILE.unlink()
 

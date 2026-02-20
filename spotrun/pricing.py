@@ -23,7 +23,20 @@ COMPUTE_INSTANCES: list[tuple[str, int, str]] = [
     ("c6a.16xlarge",  64, "x86_64"),
 ]
 
-MAX_WORKERS = (64 - 2) // 2  # 31
+MAX_WORKERS_X86 = (64 - 2) // 2  # 31 (x86: 2 vCPUs per physical core)
+MAX_WORKERS_ARM = 64 - 2          # 62 (ARM/Graviton: 1 vCPU = 1 physical core)
+
+
+def _vcpus_needed(workers: int, arch: str) -> int:
+    """Minimum vCPUs for a given worker count, accounting for architecture.
+
+    x86: each physical core has 2 vCPUs (hyperthreading), so workers * 2 + 2.
+    ARM/Graviton: each vCPU IS a physical core (no HT), so workers + 2.
+    The +2 reserves capacity for the OS and SSH.
+    """
+    if arch == "arm64":
+        return workers + 2
+    return workers * 2 + 2
 
 
 def select_instance(
@@ -45,18 +58,18 @@ def select_instance(
     """
     if workers < 1:
         raise ValueError(f"workers must be >= 1, got {workers}")
-    if workers > MAX_WORKERS:
+    max_workers = MAX_WORKERS_ARM if include_arm else MAX_WORKERS_X86
+    if workers > max_workers:
         raise ValueError(
-            f"Requested {workers} workers but max supported is {MAX_WORKERS}."
+            f"Requested {workers} workers but max supported is {max_workers}."
         )
-    required = workers * 2 + 2
 
     candidates = [
         (it, vc) for it, vc, arch in COMPUTE_INSTANCES
-        if vc >= required and (include_arm or arch == "x86_64")
+        if vc >= _vcpus_needed(workers, arch) and (include_arm or arch == "x86_64")
     ]
     if not candidates:
-        raise ValueError(f"No instance with enough vCPUs for {workers} workers (need {required}).")
+        raise ValueError(f"No instance with enough vCPUs for {workers} workers.")
 
     if prices:
         priced = [(it, vc, prices[it]) for it, vc in candidates if it in prices]

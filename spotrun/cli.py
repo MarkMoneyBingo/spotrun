@@ -30,6 +30,7 @@ def launch(
     requirements: Optional[str] = typer.Option(None, "--requirements", "-r", help="Path to requirements.txt"),
     arm: bool = typer.Option(False, "--arm", help="Include ARM/Graviton instances (cheaper but may have compatibility issues)"),
     no_ht: bool = typer.Option(False, "--no-ht", help="Disable hyperthreading (1 thread per core). Best for CPU-bound single-threaded workloads like Python multiprocessing"),
+    idle_timeout: int = typer.Option(300, "--idle-timeout", help="Seconds of inactivity before auto-terminating instance (0 to disable)"),
 ) -> None:
     """Launch a spot instance, optionally sync files and run a command."""
     session = Session(
@@ -43,7 +44,7 @@ def launch(
     should_teardown = True
 
     try:
-        session.launch()
+        session.launch(idle_timeout=idle_timeout)
 
         if sync:
             session.sync(sync)
@@ -221,7 +222,7 @@ def teardown() -> None:
     region = state.get("region")
     if not instance_id:
         console.print("[yellow]State file is incomplete. Clearing.[/yellow]")
-        Session._clear_state()
+        Session.clear_state_file()
         return
 
     from spotrun.ec2 import EC2Manager
@@ -232,7 +233,7 @@ def teardown() -> None:
     except Exception as e:
         console.print(f"[yellow]Teardown warning: {e}[/yellow]")
 
-    Session._clear_state()
+    Session.clear_state_file()
     console.print("[green]Teardown complete.[/green]")
 
 

@@ -77,10 +77,16 @@ class DataSync:
         ]
         subprocess.run(cmd, check=True)
 
-    def ssh_run(self, command: str, capture: bool = False) -> int | str:
+    def ssh_run(
+        self, command: str, capture: bool = False, quiet: bool = False,
+        stop_event=None,
+    ) -> int | str:
         """Run a command on the remote host via SSH.
 
         If capture=True, return stdout as a string.
+        If quiet=True, suppress all output and just return exit code.
+        If stop_event is provided (threading.Event), poll it during quiet execution
+        so the caller can interrupt a long-running SSH command.
         Otherwise, stream to terminal and return the exit code.
         """
         cmd = [
@@ -96,6 +102,29 @@ class DataSync:
                     result.returncode, cmd, result.stdout, result.stderr
                 )
             return result.stdout
+        if quiet:
+            if stop_event is not None:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                while proc.poll() is None:
+                    if stop_event.is_set():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                        return -1
+                    import time
+                    time.sleep(1)
+                return proc.returncode
+            result = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return result.returncode
         # Force PTY allocation so remote Rich progress bars render properly.
         # Pass local terminal width so remote Rich renders at the right size.
         try:
