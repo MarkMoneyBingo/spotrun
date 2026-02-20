@@ -96,8 +96,14 @@ class DataSync:
                     result.returncode, cmd, result.stdout, result.stderr
                 )
             return result.stdout
-        # Force PTY allocation so remote Rich progress bars render properly
-        interactive_cmd = ["ssh", "-t", *self.ssh_opts, self.remote, command]
+        # Force PTY allocation so remote Rich progress bars render properly.
+        # Pass local terminal width so remote Rich renders at the right size.
+        try:
+            cols = os.get_terminal_size().columns
+        except OSError:
+            cols = 120
+        wrapped = f"export COLUMNS={cols}; {command}"
+        interactive_cmd = ["ssh", "-t", *self.ssh_opts, self.remote, wrapped]
         result = subprocess.run(interactive_cmd)
         return result.returncode
 
