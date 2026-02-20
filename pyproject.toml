@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spotrun"
+version = "0.1.0"
+description = "Burst compute to AWS spot instances. Zero config, one command."
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Mark Rosenberg", email = "mark@hipecommerce.com" },
+]
+readme = "README.md"
+keywords = ["aws", "spot-instances", "ec2", "cloud-compute", "burst-compute"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = [
+    "boto3>=1.34.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/markcrosen/spotrun"
+Repository = "https://github.com/markcrosen/spotrun"
+Issues = "https://github.com/markcrosen/spotrun/issues"
+
+[project.scripts]
+spotrun = "spotrun.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["spotrun"]

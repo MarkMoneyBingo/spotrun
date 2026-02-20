@@ -1,0 +1,248 @@
+"""Session -- the main user-facing orchestrator."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from spotrun.ami import AMIManager
+from spotrun.ec2 import EC2Manager, find_cheapest_region
+from spotrun.pricing import all_instance_types, select_instance
+from spotrun.sync import DataSync
+
+console = Console()
+STATE_FILE = Path.home() / ".spotrun" / "state.json"
+
+
+class Session:
+    """Orchestrates the full lifecycle: launch, sync, run, teardown."""
+
+    def __init__(
+        self,
+        workers: int = 4,
+        region: str | None = None,
+        project_tag: str = "spotrun",
+        bootstrap_script: str | None = None,
+        requirements_file: str | None = None,
+        include_arm: bool = False,
+    ) -> None:
+        self.workers = workers
+        self.project_tag = project_tag
+        self.bootstrap_script = bootstrap_script
+        self.requirements_file = requirements_file
+        self.include_arm = include_arm
+
+        # Auto-select cheapest region if none specified
+        if region is None and "AWS_REGION" not in os.environ:
+            instance_type, _ = select_instance(workers, include_arm=include_arm)
+            region, _ = find_cheapest_region(instance_type)
+
+        self.ec2 = EC2Manager(region=region)
+        self.ami_mgr = AMIManager(self.ec2)
+        self._sync: DataSync | None = None
+        self._instance_id: str | None = None
+        self._ip: str | None = None
+        self._pem_path: str | None = None
+
+    def launch(
+        self,
+        bootstrap_script: str | None = None,
+        requirements_file: str | None = None,
+    ) -> str:
+        """Provision infrastructure and launch a spot instance. Returns public IP."""
+        bootstrap_script = bootstrap_script or self.bootstrap_script
+        requirements_file = requirements_file or self.requirements_file
+
+        from spotrun.pricing import instance_arch
+
+        # 1. Ensure infra
+        key_name, pem_path, sg_id = self.ec2.ensure_infra(self.project_tag)
+        self._pem_path = pem_path
+
+        # 2. Spot prices and instance selection (cheapest that fits)
+        prices = self.ec2.get_spot_prices(all_instance_types(include_arm=self.include_arm))
+        instance_type, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
+        arch = instance_arch(instance_type)
+        spot_price = prices.get(instance_type)
+        self._show_pricing(instance_type, vcpus, spot_price, prices)
+
+        # 3. Find or create AMI (must match selected architecture)
+        ami_id = self.ami_mgr.find_existing(self.project_tag, arch=arch)
+        if ami_id:
+            console.print(f"Using existing AMI: [bold]{ami_id}[/bold] ({arch})")
+        else:
+            console.print(f"No existing AMI found for {arch}, building one...")
+            ami_id = self.ami_mgr.create(
+                key_name, pem_path, sg_id,
+                bootstrap_script=bootstrap_script,
+                requirements_file=requirements_file,
+                project_tag=self.project_tag,
+                arch=arch,
+            )
+
+        # 5. Request spot instance
+        with console.status(f"Requesting [bold]{instance_type}[/bold] spot instance..."):
+            self._instance_id = self.ec2.request_spot_instance(
+                instance_type=instance_type,
+                ami_id=ami_id,
+                key_name=key_name,
+                sg_id=sg_id,
+                project_tag=self.project_tag,
+            )
+            console.print(f"Instance: [bold]{self._instance_id}[/bold]")
+
+        # Save state early so `spotrun teardown` can find orphaned instances
+        self._save_state(key_name, sg_id)
+
+        # 6. Wait for running + SSH (clean up instance on failure)
+        try:
+            with console.status("Waiting for instance to start..."):
+                self._ip = self.ec2.wait_for_running(self._instance_id)
+                console.print(f"Public IP: [bold]{self._ip}[/bold]")
+
+            with console.status("Waiting for SSH..."):
+                self.ec2.wait_for_ssh(self._ip)
+        except Exception:
+            try:
+                self.teardown()
+            except Exception:
+                pass  # Original exception takes priority
+            raise
+
+        self._sync = DataSync(self._ip, pem_path)
+
+        # Update state with IP now that instance is running
+        self._save_state(key_name, sg_id)
+
+        console.print("[green bold]Instance ready.[/green bold]")
+        return self._ip
+
+    def sync(self, paths: list[str], remote_base: str = "/opt/project") -> None:
+        """Rsync individual paths to the remote instance."""
+        if not self._sync:
+            raise RuntimeError("No active session. Call launch() first.")
+        for path in paths:
+            self._sync.rsync_to(path, remote_base)
+
+    def sync_project(
+        self,
+        local_root: str = ".",
+        remote_root: str = "/opt/project",
+        excludes: list[str] | None = None,
+    ) -> None:
+        """Rsync an entire project directory."""
+        if not self._sync:
+            raise RuntimeError("No active session. Call launch() first.")
+        self._sync.rsync_project(local_root, remote_root, excludes=excludes)
+
+    def run(self, command: str) -> int:
+        """Run a command on the remote instance. Returns exit code."""
+        if not self._sync:
+            raise RuntimeError("No active session. Call launch() first.")
+        result = self._sync.ssh_run(command)
+        assert isinstance(result, int)
+        return result
+
+    def ssh(self) -> None:
+        """Drop into an interactive SSH session (replaces this process)."""
+        if not self._sync:
+            raise RuntimeError("No active session. Call launch() first.")
+        self._sync.ssh_interactive()
+
+    def teardown(self) -> None:
+        """Terminate the instance and clean up state."""
+        if self._instance_id:
+            self.ec2.terminate_instance(self._instance_id)
+            self._instance_id = None
+            self._ip = None
+            self._sync = None
+        self._clear_state()
+
+    def get_pricing_info(self) -> dict:
+        """Return pricing info without launching anything."""
+        prices = self.ec2.get_spot_prices(all_instance_types(include_arm=self.include_arm))
+        instance_type, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
+        spot_price = prices.get(instance_type)
+        return {
+            "instance_type": instance_type,
+            "vcpus": vcpus,
+            "spot_price": spot_price,
+            "all_prices": prices,
+        }
+
+    # -- Context manager --
+
+    def __enter__(self) -> Session:
+        self.launch()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.teardown()
+
+    # -- Internal --
+
+    def _show_pricing(
+        self,
+        instance_type: str,
+        vcpus: int,
+        spot_price: float | None,
+        all_prices: dict[str, float],
+    ) -> None:
+        table = Table(title="Spot Prices", show_header=True)
+        table.add_column("Instance", style="cyan")
+        table.add_column("vCPUs", justify="right")
+        table.add_column("$/hr", justify="right", style="green")
+        from spotrun.pricing import COMPUTE_INSTANCES
+        for itype, vcpu_count, arch in COMPUTE_INSTANCES:
+            if itype not in all_prices:
+                continue
+            price = all_prices[itype]
+            price_str = f"${price:.4f}"
+            marker = " <--" if itype == instance_type else ""
+            table.add_row(itype, str(vcpu_count), price_str + marker)
+        console.print(table)
+        if spot_price is not None and spot_price > 0:
+            console.print(
+                Panel(
+                    f"[bold]{instance_type}[/bold] ({vcpus} vCPUs) @ "
+                    f"[green]${spot_price:.4f}/hr[/green]",
+                    title="Selected Instance",
+                )
+            )
+
+    def _save_state(self, key_name: str, sg_id: str) -> None:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state = {
+            "instance_id": self._instance_id,
+            "ip": self._ip,
+            "region": self.ec2.region,
+            "pem_path": self._pem_path,
+            "key_name": key_name,
+            "sg_id": sg_id,
+        }
+        content = json.dumps(state, indent=2)
+        fd = os.open(
+            str(STATE_FILE),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+
+    @staticmethod
+    def _clear_state() -> None:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+
+    @staticmethod
+    def load_state() -> dict | None:
+        """Load saved state from disk, or None if no state file."""
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text())
+        return None
