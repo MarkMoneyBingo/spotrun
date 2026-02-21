@@ -102,9 +102,11 @@ class AMIManager:
             with console.status("Running bootstrap script..."):
                 sync.scp_to(script_path, "/tmp/bootstrap.sh")
                 if requirements_file:
+                    import os
                     sync.ssh_run("sudo mkdir -p /opt/project", capture=True)
                     sync.ssh_run("sudo chown ubuntu:ubuntu /opt/project", capture=True)
-                    sync.scp_to(requirements_file, "/opt/project/requirements.txt")
+                    remote_name = os.path.basename(requirements_file)
+                    sync.scp_to(requirements_file, f"/opt/project/{remote_name}")
                 exit_code = sync.ssh_run("chmod +x /tmp/bootstrap.sh && /tmp/bootstrap.sh")
                 if exit_code != 0:
                     raise RuntimeError(f"Bootstrap script failed with exit code {exit_code}")

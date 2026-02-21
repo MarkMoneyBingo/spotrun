@@ -15,7 +15,22 @@ python3 -m venv "$PROJ/.venv"
 source "$PROJ/.venv/bin/activate"
 pip install --quiet --upgrade pip
 
-if [ -f "$PROJ/requirements.txt" ]; then
+# Install dependencies from whichever format is available
+if [ -f "$PROJ/pyproject.toml" ]; then
+    python3 << 'PYEOF'
+import subprocess, sys
+try:
+    import tomllib
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "tomli"])
+    import tomli as tomllib
+with open("/opt/project/pyproject.toml", "rb") as f:
+    deps = tomllib.load(f).get("project", {}).get("dependencies", [])
+if deps:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + deps)
+    print(f"Installed {len(deps)} dependencies from pyproject.toml")
+PYEOF
+elif [ -f "$PROJ/requirements.txt" ]; then
     pip install --quiet -r "$PROJ/requirements.txt"
 fi
 
