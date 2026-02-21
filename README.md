@@ -46,8 +46,9 @@ That's it. spotrun will:
 3. Build a custom AMI with Python, venv, and common packages (first run only)
 4. Launch a spot instance sized for your worker count
 5. Rsync your files to the instance
-6. Run your command over SSH, streaming output live
-7. Terminate the instance when done
+6. Auto-install Python dependencies from `requirements.txt` or `pyproject.toml`
+7. Run your command over SSH (with venv activated), streaming output live
+8. Terminate the instance when done
 
 You only pay for the minutes you use, at spot prices (typically 60-90% cheaper than on-demand).
 
@@ -79,6 +80,7 @@ spotrun teardown
 | `--ssh` | Drop into an interactive SSH session instead of running a command. |
 | `--arm` | Include ARM/Graviton instances (often 20-40% cheaper, see below). |
 | `--no-ht` | Disable hyperthreading (x86 only). Best for CPU-bound workloads. See [CPU Options](#cpu-options). |
+| `--no-install` | Skip automatic Python dependency installation after sync. |
 | `--tag` | Project tag for AWS resources (default: `spotrun`). |
 | `--bootstrap` | Path to a custom bootstrap script (replaces the default). |
 | `--requirements, -r` | Path to `requirements.txt` to pre-install in the AMI. |
@@ -91,6 +93,7 @@ Use spotrun as a library for programmatic control:
 from spotrun import Session
 
 # Context manager -- instance auto-terminates on exit
+# Dependencies from requirements.txt/pyproject.toml are auto-installed after sync
 with Session(workers=8) as s:
     s.sync_project(".")
     s.run("cd /opt/project && python train.py")
@@ -110,6 +113,7 @@ s = Session(workers=8)
 ip = s.launch()
 s.sync_project(".", excludes=[".git", "__pycache__", "*.pyc"])
 s.sync(["data/model.pt", ".env"])
+s.install_deps()  # auto-detects requirements.txt or pyproject.toml
 exit_code = s.run("cd /opt/project && python train.py --workers 8")
 s.teardown()
 ```
@@ -118,11 +122,12 @@ s.teardown()
 
 | Method | Description |
 |--------|-------------|
-| `Session(workers, region, project_tag, include_arm, no_hyperthreading)` | Create a session. `workers` determines instance size. `include_arm=True` enables ARM/Graviton. `no_hyperthreading=True` disables HT on x86 (see [CPU Options](#cpu-options)). |
+| `Session(workers, region, project_tag, include_arm, no_hyperthreading, auto_install)` | Create a session. `workers` determines instance size. `include_arm=True` enables ARM/Graviton. `no_hyperthreading=True` disables HT on x86 (see [CPU Options](#cpu-options)). `auto_install=False` to skip dependency installation. |
 | `.launch()` | Provision infra, find/build AMI, launch spot instance. Returns public IP. |
 | `.sync(paths)` | Rsync individual files/directories to the instance. |
 | `.sync_project(root, excludes)` | Rsync an entire project directory with sensible defaults. |
-| `.run(command)` | Run a shell command on the instance via SSH. Returns exit code. |
+| `.install_deps()` | Detect and install Python dependencies from `requirements.txt` or `pyproject.toml` on the remote. Returns True if deps were installed. |
+| `.run(command)` | Run a shell command on the instance via SSH. The project venv is activated automatically. Pass `activate_venv=False` for non-Python commands. Returns exit code. |
 | `.ssh()` | Open an interactive SSH session (replaces current process). |
 | `.teardown()` | Terminate the instance and clean up state. |
 | `.get_pricing_info()` | Return pricing info without launching anything. |
@@ -279,6 +284,24 @@ export AWS_REGION=us-east-1
 
 Infrastructure (key pair, security group, AMI) is created per-region and cached, so switching regions incurs a one-time AMI build.
 
+## Python Dependencies
+
+spotrun automatically handles Python dependencies. After syncing your files, it checks for `requirements.txt` or `pyproject.toml` in the remote project directory and installs dependencies into the instance's venv. The venv is activated automatically when running commands, so `python` and all installed packages just work.
+
+```bash
+# Dependencies from requirements.txt or pyproject.toml are auto-installed
+spotrun launch --workers 8 --sync . "python train.py"
+
+# Skip auto-install (e.g. if deps are baked into a custom AMI)
+spotrun launch --workers 8 --sync . --no-install "python train.py"
+```
+
+For faster launches, you can pre-bake dependencies into the AMI with `--requirements` during setup. Auto-install still runs at launch but skips already-installed packages:
+
+```bash
+spotrun setup --requirements requirements.txt
+```
+
 ## Custom Bootstrap
 
 The default bootstrap script installs Python 3, a venv, build-essential, and rsync. You can replace it with your own:
@@ -286,14 +309,6 @@ The default bootstrap script installs Python 3, a venv, build-essential, and rsy
 ```bash
 spotrun setup --bootstrap ./my-bootstrap.sh
 ```
-
-Or pre-install your Python dependencies into the AMI:
-
-```bash
-spotrun setup --requirements requirements.txt
-```
-
-This bakes your dependencies into the AMI so they don't need to be installed on every launch.
 
 ## How It Works
 

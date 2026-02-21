@@ -15,6 +15,9 @@ python3 -m venv "$PROJ/.venv"
 source "$PROJ/.venv/bin/activate"
 pip install --quiet --upgrade pip
 
+# Ensure 'python' works system-wide (Ubuntu 24.04 only ships python3)
+sudo ln -sf /usr/bin/python3 /usr/bin/python
+
 # Install dependencies from whichever format is available
 if [ -f "$PROJ/pyproject.toml" ]; then
     python3 << 'PYEOF'

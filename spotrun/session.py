@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 from rich.console import Console
@@ -33,6 +34,7 @@ class Session:
         include_arm: bool = False,
         no_hyperthreading: bool = False,
         save_state: bool = True,
+        auto_install: bool = True,
     ) -> None:
         self.workers = workers
         self.project_tag = project_tag
@@ -41,6 +43,7 @@ class Session:
         self.requirements_file = requirements_file
         self.include_arm = include_arm
         self.no_hyperthreading = no_hyperthreading
+        self.auto_install = auto_install
 
         # Auto-select cheapest region if none specified
         if region is None and "AWS_REGION" not in os.environ:
@@ -168,16 +171,100 @@ class Session:
             raise RuntimeError("No active session. Call launch() first.")
         self._sync.rsync_project(local_root, remote_root, excludes=excludes)
 
-    def run(self, command: str, quiet: bool = False, stop_event=None) -> int:
-        """Run a command on the remote instance. Returns exit code.
+    def install_deps(self, remote_root: str = "/opt/project") -> bool:
+        """Detect and install Python dependencies on the remote instance.
 
-        If stop_event (threading.Event) is provided and quiet=True, the SSH
-        process will be polled so it can be interrupted when the event is set.
+        Checks for requirements.txt or pyproject.toml in the remote project
+        directory and installs into the existing venv.
+
+        Returns True if dependencies were installed, False if skipped.
         """
         if not self._sync:
             raise RuntimeError("No active session. Call launch() first.")
+
+        # Guard: skip if no venv exists (e.g. custom bootstrap that skipped it)
+        venv_check = self._sync.ssh_run(
+            f"test -d {remote_root}/.venv/bin", quiet=True,
+        )
+        if venv_check != 0:
+            return False
+
+        # Detect which deps file exists (single SSH round-trip)
+        detect_cmd = (
+            f"test -f {remote_root}/requirements.txt && echo requirements "
+            f"|| (test -f {remote_root}/pyproject.toml && echo pyproject "
+            f"|| echo none)"
+        )
+        try:
+            result = self._sync.ssh_run(detect_cmd, capture=True)
+        except subprocess.CalledProcessError:
+            console.print("[yellow]Warning: could not detect dependency files[/yellow]")
+            return False
+        if not isinstance(result, str):
+            return False
+        deps_type = result.strip()
+
+        if deps_type == "none":
+            return False
+
+        venv_pip = f"{remote_root}/.venv/bin/pip"
+        venv_python = f"{remote_root}/.venv/bin/python"
+
+        if deps_type == "requirements":
+            console.print("[dim]Installing dependencies from requirements.txt...[/dim]")
+            install_cmd = f"{venv_pip} install --quiet -r {remote_root}/requirements.txt"
+        elif deps_type == "pyproject":
+            console.print("[dim]Installing dependencies from pyproject.toml...[/dim]")
+            install_cmd = (
+                f"{venv_python} << 'PYEOF'\n"
+                "import subprocess, sys\n"
+                "try:\n"
+                "    import tomllib\n"
+                "except ImportError:\n"
+                '    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "tomli"])\n'
+                "    import tomli as tomllib\n"
+                f'with open("{remote_root}/pyproject.toml", "rb") as f:\n'
+                '    deps = tomllib.load(f).get("project", {}).get("dependencies", [])\n'
+                "if deps:\n"
+                '    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + deps)\n'
+                '    print(f"Installed {len(deps)} dependencies from pyproject.toml")\n'
+                "else:\n"
+                '    print("No dependencies found in pyproject.toml")\n'
+                "PYEOF"
+            )
+        else:
+            return False
+
+        exit_code = self._sync.ssh_run(install_cmd)
+        if not isinstance(exit_code, int):
+            exit_code = -1
+        if exit_code != 0:
+            console.print("[yellow]Warning: dependency installation returned non-zero exit code[/yellow]")
+        return True
+
+    def run(self, command: str, quiet: bool = False, stop_event=None,
+            activate_venv: bool = True, remote_root: str = "/opt/project") -> int:
+        """Run a command on the remote instance. Returns exit code.
+
+        Args:
+            command: Shell command to execute.
+            quiet: If True, suppress all output.
+            stop_event: threading.Event to interrupt long-running commands.
+            activate_venv: If True (default), activate the project venv before
+                running the command. Safe even if no venv exists.
+            remote_root: Project root on the remote instance.
+        """
+        if not self._sync:
+            raise RuntimeError("No active session. Call launch() first.")
+        if activate_venv:
+            activate = f"{remote_root}/.venv/bin/activate"
+            command = (
+                f"if [ -f {activate} ]; then source {activate}; fi && "
+                f"({command})"
+            )
         result = self._sync.ssh_run(command, quiet=quiet, stop_event=stop_event)
-        assert isinstance(result, int)
+        if not isinstance(result, int):
+            return -1
         return result
 
     def ssh(self) -> None:
@@ -235,6 +322,7 @@ class Session:
             "fi; done"
             "' >/dev/null 2>&1 &",
             quiet=True,
+            activate_venv=False,
         )
 
     def _show_pricing(
