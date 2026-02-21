@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -102,7 +103,6 @@ class AMIManager:
             with console.status("Running bootstrap script..."):
                 sync.scp_to(script_path, "/tmp/bootstrap.sh")
                 if requirements_file:
-                    import os
                     sync.ssh_run("sudo mkdir -p /opt/project", capture=True)
                     sync.ssh_run("sudo chown ubuntu:ubuntu /opt/project", capture=True)
                     remote_name = os.path.basename(requirements_file)

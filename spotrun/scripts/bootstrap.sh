@@ -9,7 +9,7 @@ sudo apt-get install -y -qq python3 python3-venv python3-pip build-essential lib
 
 PROJ=/opt/project
 sudo mkdir -p "$PROJ"
-sudo chown $(whoami):$(whoami) "$PROJ"
+sudo chown "$(whoami):$(whoami)" "$PROJ"
 
 python3 -m venv "$PROJ/.venv"
 source "$PROJ/.venv/bin/activate"
