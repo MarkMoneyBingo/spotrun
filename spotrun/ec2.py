@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from rich.console import Console
 
 console = Console()
 SPOTRUN_DIR = Path.home() / ".spotrun"
+
+# Serialize ensure_infra across threads to prevent key pair race conditions
+_infra_lock = threading.Lock()
 
 CANDIDATE_REGIONS = [
     "us-east-1",
@@ -81,40 +85,45 @@ class EC2Manager:
     def ensure_infra(self, project_tag: str = "spotrun") -> tuple[str, str, str]:
         """Ensure key pair and security group exist.
 
+        Thread-safe: uses a lock to prevent race conditions when multiple
+        threads try to create the same key pair simultaneously.
+
         Returns (key_name, pem_path, sg_id).
         """
         key_name = f"{project_tag}-{self.region}"
         pem_path = str(SPOTRUN_DIR / f"{key_name}.pem")
-        SPOTRUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
-        # Key pair
-        need_create = False
-        try:
-            self.client.describe_key_pairs(KeyNames=[key_name])
-            if not Path(pem_path).exists():
-                console.print(
-                    f"[yellow]Key pair [bold]{key_name}[/bold] exists in AWS "
-                    f"but PEM file missing locally. Recreating...[/yellow]"
-                )
-                self.client.delete_key_pair(KeyName=key_name)
+        with _infra_lock:
+            SPOTRUN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+            # Key pair
+            need_create = False
+            try:
+                self.client.describe_key_pairs(KeyNames=[key_name])
+                if not Path(pem_path).exists():
+                    console.print(
+                        f"[yellow]Key pair [bold]{key_name}[/bold] exists in AWS "
+                        f"but PEM file missing locally. Recreating...[/yellow]"
+                    )
+                    self.client.delete_key_pair(KeyName=key_name)
+                    need_create = True
+                else:
+                    console.print(f"[dim]Key pair [bold]{key_name}[/bold] exists[/dim]")
+            except ClientError as e:
+                if e.response["Error"]["Code"] not in (
+                    "InvalidKeyPair.NotFound",
+                ):
+                    raise
                 need_create = True
-            else:
-                console.print(f"[dim]Key pair [bold]{key_name}[/bold] exists[/dim]")
-        except ClientError as e:
-            if e.response["Error"]["Code"] not in (
-                "InvalidKeyPair.NotFound",
-            ):
-                raise
-            need_create = True
 
-        if need_create:
-            console.print(f"Creating key pair [bold]{key_name}[/bold]")
-            resp = self.client.create_key_pair(KeyName=key_name)
-            fd = os.open(pem_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR)
-            with os.fdopen(fd, "w") as f:
-                f.write(resp["KeyMaterial"])
+            if need_create:
+                console.print(f"Creating key pair [bold]{key_name}[/bold]")
+                resp = self.client.create_key_pair(KeyName=key_name)
+                fd = os.open(pem_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR)
+                with os.fdopen(fd, "w") as f:
+                    f.write(resp["KeyMaterial"])
 
-        # Security group
+        # Security group (already idempotent, no lock needed)
         sg_name = f"{project_tag}-ssh"
         sg_id = self._ensure_security_group(sg_name, project_tag)
 
