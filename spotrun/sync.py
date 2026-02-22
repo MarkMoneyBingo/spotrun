@@ -67,6 +67,7 @@ class DataSync:
         self.host = host
         self.pem_path = pem_path
         self.user = user
+        self.last_output_tail: str = ""
         self.ssh_opts = [
             "-i", pem_path,
             "-o", "StrictHostKeyChecking=accept-new",
@@ -185,7 +186,7 @@ class DataSync:
 
     def ssh_run(
         self, command: str, capture: bool = False, quiet: bool = False,
-        stop_event=None,
+        stop_event=None, tail_lines: int = 0,
     ) -> int | str:
         """Run a command on the remote host via SSH.
 
@@ -193,6 +194,8 @@ class DataSync:
         If quiet=True, suppress all output and just return exit code.
         If stop_event is provided (threading.Event), poll it during quiet execution
         so the caller can interrupt a long-running SSH command.
+        If tail_lines > 0 and quiet=True, keep the last N lines of combined
+        stdout/stderr in ``self.last_output_tail`` (useful for error diagnostics).
         Otherwise, stream to terminal and return the exit code.
         """
         cmd = [
@@ -209,6 +212,8 @@ class DataSync:
                 )
             return result.stdout
         if quiet:
+            if tail_lines > 0:
+                return self._ssh_run_quiet_tail(cmd, tail_lines, stop_event)
             if stop_event is not None:
                 proc = subprocess.Popen(
                     cmd, stdin=subprocess.DEVNULL,
@@ -241,6 +246,56 @@ class DataSync:
         interactive_cmd = ["ssh", "-t", *self.ssh_opts, self.remote, wrapped]
         result = subprocess.run(interactive_cmd)
         return result.returncode
+
+    def _ssh_run_quiet_tail(
+        self, cmd: list[str], tail_lines: int, stop_event=None,
+    ) -> int:
+        """Run an SSH command quietly, keeping the last *tail_lines* of output.
+
+        Combined stdout/stderr is stored in ``self.last_output_tail``.
+        A background reader thread drains the pipe so the remote process
+        never blocks on a full buffer.
+        """
+        import threading as _threading
+        import time as _time
+        from collections import deque
+
+        tail: deque[str] = deque(maxlen=tail_lines)
+
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        def _reader() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                tail.append(line.rstrip("\n"))
+            proc.stdout.close()
+
+        reader = _threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        if stop_event is not None:
+            while proc.poll() is None:
+                if stop_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    reader.join(timeout=5)
+                    self.last_output_tail = "\n".join(tail)
+                    return -1
+                _time.sleep(1)
+        else:
+            proc.wait()
+
+        reader.join(timeout=5)
+        self.last_output_tail = "\n".join(tail)
+        return proc.returncode
 
     def ssh_interactive(self) -> None:
         """Replace this process with an interactive SSH session."""

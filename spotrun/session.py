@@ -44,6 +44,7 @@ class Session:
         self.include_arm = include_arm
         self.no_hyperthreading = no_hyperthreading
         self.auto_install = auto_install
+        self.last_output: str = ""
 
         # Auto-select cheapest region if none specified
         if region is None and "AWS_REGION" not in os.environ:
@@ -249,7 +250,8 @@ class Session:
         return True
 
     def run(self, command: str, quiet: bool = False, stop_event=None,
-            activate_venv: bool = True, remote_root: str = "/opt/project") -> int:
+            activate_venv: bool = True, remote_root: str = "/opt/project",
+            tail_lines: int = 0) -> int:
         """Run a command on the remote instance. Returns exit code.
 
         Args:
@@ -259,6 +261,9 @@ class Session:
             activate_venv: If True (default), activate the project venv before
                 running the command. Safe even if no venv exists.
             remote_root: Project root on the remote instance.
+            tail_lines: When > 0 and quiet=True, capture the last N lines of
+                combined stdout/stderr. Available via ``self.last_output``
+                after the call returns (useful for error diagnostics).
         """
         if not self._sync:
             raise RuntimeError("No active session. Call launch() first.")
@@ -268,7 +273,11 @@ class Session:
                 f"if [ -f {activate} ]; then source {activate}; fi && "
                 f"({command})"
             )
-        result = self._sync.ssh_run(command, quiet=quiet, stop_event=stop_event)
+        result = self._sync.ssh_run(
+            command, quiet=quiet, stop_event=stop_event, tail_lines=tail_lines,
+        )
+        if tail_lines > 0:
+            self.last_output = self._sync.last_output_tail
         if not isinstance(result, int):
             return -1
         return result
