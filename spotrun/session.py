@@ -153,23 +153,29 @@ class Session:
         console.print("[green bold]Instance ready.[/green bold]")
         return self._ip
 
-    def sync(self, paths: list[str], remote_base: str = "/opt/project") -> None:
+    def sync(self, paths: list[str], remote_base: str = "/opt/project",
+             quiet: bool = False) -> None:
         """Rsync individual paths to the remote instance."""
         if not self._sync:
             raise RuntimeError("No active session. Call launch() first.")
         for path in paths:
-            self._sync.rsync_to(path, remote_base)
+            self._sync.rsync_to(path, remote_base, quiet=quiet)
 
     def sync_project(
         self,
         local_root: str = ".",
         remote_root: str = "/opt/project",
         excludes: list[str] | None = None,
+        quiet: bool = False,
+        n_instances: int = 1,
     ) -> None:
         """Rsync an entire project directory."""
         if not self._sync:
             raise RuntimeError("No active session. Call launch() first.")
-        self._sync.rsync_project(local_root, remote_root, excludes=excludes)
+        self._sync.rsync_project(
+            local_root, remote_root, excludes=excludes,
+            quiet=quiet, n_instances=n_instances,
+        )
 
     def install_deps(self, remote_root: str = "/opt/project") -> bool:
         """Detect and install Python dependencies on the remote instance.
