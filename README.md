@@ -123,7 +123,7 @@ s.teardown()
 | Method | Description |
 |--------|-------------|
 | `Session(workers, region, project_tag, include_arm, no_hyperthreading, auto_install)` | Create a session. `workers` determines instance size. `include_arm=True` enables ARM/Graviton. `no_hyperthreading=True` disables HT on x86 (see [CPU Options](#cpu-options)). `auto_install=False` to skip dependency installation. |
-| `.launch()` | Provision infra, find/build AMI, launch spot instance. Returns public IP. |
+| `.launch(idle_timeout=300)` | Provision infra, find/build AMI, launch spot instance. Returns public IP. The idle watchdog auto-terminates after `idle_timeout` seconds of inactivity (see [Idle Watchdog & Heartbeat](#idle-watchdog--heartbeat)). |
 | `.sync(paths)` | Rsync individual files/directories to the instance. |
 | `.sync_project(root, excludes)` | Rsync an entire project directory with sensible defaults. |
 | `.install_deps()` | Detect and install Python dependencies from `requirements.txt` or `pyproject.toml` on the remote. Returns True if deps were installed. |
@@ -334,6 +334,48 @@ The AMI is cached by tag -- subsequent runs skip this step. Use `spotrun setup -
 ### State
 
 Active instance info is saved to `~/.spotrun/state.json`. This allows `spotrun teardown` to work without arguments. The state file is automatically cleaned up on teardown.
+
+## Idle Watchdog & Heartbeat
+
+After launch, spotrun installs a background watchdog that auto-terminates the instance after a period of inactivity (default: 5 minutes). This prevents forgotten instances from running up your AWS bill.
+
+The watchdog considers the instance **active** when either:
+1. An SSH connection is open, **or**
+2. The heartbeat file `/tmp/spotrun-heartbeat` was updated recently
+
+For short commands this just works -- the SSH connection keeps the instance alive while your command runs, and the watchdog shuts it down shortly after.
+
+For **long-running background workloads** where the SSH connection may drop (network timeouts, spot recovery, etc.), have your process touch the heartbeat file periodically:
+
+```bash
+# Start a heartbeat alongside your workload
+(while true; do touch /tmp/spotrun-heartbeat; sleep 30; done) &
+HBPID=$!
+trap "kill $HBPID 2>/dev/null" EXIT
+
+# Run your workload
+python train.py --epochs 100
+
+# When the workload exits, the trap kills the heartbeat.
+# The watchdog will then shut down the instance after the idle timeout.
+```
+
+Or from Python:
+
+```python
+import subprocess, atexit
+hb = subprocess.Popen(
+    ["bash", "-c", "while true; do touch /tmp/spotrun-heartbeat; sleep 30; done"]
+)
+atexit.register(hb.kill)
+```
+
+To adjust or disable the idle timeout:
+
+```python
+s.launch(idle_timeout=600)   # 10-minute timeout
+s.launch(idle_timeout=0)     # disable watchdog entirely (not recommended)
+```
 
 ## Cost Awareness
 

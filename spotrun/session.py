@@ -95,6 +95,9 @@ class Session:
             requirements_file: Path to requirements.txt to pre-install in AMI.
             idle_timeout: Seconds of inactivity before auto-terminating the
                 instance.  Defaults to 300 (5 minutes). Set to 0 to disable.
+                Long-running processes can prevent shutdown by touching
+                ``/tmp/spotrun-heartbeat`` periodically (see
+                :attr:`Session.HEARTBEAT_FILE`).
             fallback: If True (default), try alternative instance types and
                 regions on capacity errors. If False, raise SpotCapacityError
                 on the first capacity failure.
@@ -493,21 +496,46 @@ class Session:
 
     # -- Internal --
 
+    HEARTBEAT_FILE = "/tmp/spotrun-heartbeat"
+    """Path to the heartbeat file checked by the idle watchdog.
+
+    Long-running remote processes can touch this file periodically to
+    signal that work is still in progress, preventing the watchdog from
+    shutting down the instance even when there is no active SSH connection.
+
+    Example (bash, run alongside your workload)::
+
+        (while true; do touch /tmp/spotrun-heartbeat; sleep 30; done) &
+
+    The watchdog considers the instance active when **either** an SSH
+    connection exists **or** the heartbeat file was modified within the
+    last *idle_timeout* seconds.
+    """
+
     def _install_idle_watchdog(self, timeout_seconds: int) -> None:
         """Install a background watchdog that shuts down the instance after
         *timeout_seconds* of inactivity.
 
-        Inactivity is defined as: no active SSH connections to the instance.
-        This covers both interactive (PTY) and non-interactive (quiet/command)
-        sessions — any ``sshd`` child process with ``@`` in its name indicates
-        an active connection.
+        Inactivity is defined as: no active SSH connections **and** no recent
+        heartbeat file update.  Either signal alone keeps the instance alive.
+
+        Remote processes can keep the instance alive by periodically touching
+        ``/tmp/spotrun-heartbeat`` (see :attr:`Session.HEARTBEAT_FILE`).
         """
         self.run(
             "nohup bash -c '"
+            f"HB={self.HEARTBEAT_FILE}; "
             f"while true; do sleep {timeout_seconds}; "
-            'if ! pgrep -af "sshd:.*@" > /dev/null; then '
+            # Active SSH connection? Stay alive.
+            'pgrep -af "sshd:.*@" > /dev/null && continue; '
+            # Recent heartbeat file? Stay alive.
+            'if [ -f "$HB" ]; then '
+            'age=$(( $(date +%s) - $(stat -c %Y "$HB" 2>/dev/null || echo 0) )); '
+            f'[ "$age" -lt {timeout_seconds} ] && continue; '
+            "fi; "
+            # No SSH and no recent heartbeat — shut down.
             "sudo shutdown -h now; "
-            "fi; done"
+            "done"
             "' >/dev/null 2>&1 &",
             quiet=True,
             activate_venv=False,
