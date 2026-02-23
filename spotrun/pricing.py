@@ -23,20 +23,20 @@ COMPUTE_INSTANCES: list[tuple[str, int, str]] = [
     ("c6a.16xlarge",  64, "x86_64"),
 ]
 
-MAX_WORKERS_X86 = (64 - 2) // 2  # 31 (x86: 2 vCPUs per physical core)
-MAX_WORKERS_ARM = 64 - 2          # 62 (ARM/Graviton: 1 vCPU = 1 physical core)
+MAX_WORKERS_X86 = (64 - 1) // 2  # 31 (x86: 2 vCPUs per physical core)
+MAX_WORKERS_ARM = 64 - 1          # 63 (ARM/Graviton: 1 vCPU = 1 physical core)
 
 
 def _vcpus_needed(workers: int, arch: str) -> int:
     """Minimum vCPUs for a given worker count, accounting for architecture.
 
-    x86: each physical core has 2 vCPUs (hyperthreading), so workers * 2 + 2.
-    ARM/Graviton: each vCPU IS a physical core (no HT), so workers + 2.
-    The +2 reserves capacity for the OS and SSH.
+    x86: each physical core has 2 vCPUs (hyperthreading), so workers * 2 + 1.
+    ARM/Graviton: each vCPU IS a physical core (no HT), so workers + 1.
+    The +1 reserves one core for OS/SSH overhead.
     """
     if arch == "arm64":
-        return workers + 2
-    return workers * 2 + 2
+        return workers + 1
+    return workers * 2 + 1
 
 
 def select_instance(
