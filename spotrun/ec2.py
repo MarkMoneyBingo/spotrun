@@ -7,11 +7,18 @@ import socket
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 from rich.console import Console
+
+
+@contextmanager
+def _nullcontext():
+    """No-op context manager (Python 3.6 compat, avoids import)."""
+    yield
 
 console = Console()
 SPOTRUN_DIR = Path.home() / ".spotrun"
@@ -31,16 +38,44 @@ CANDIDATE_REGIONS = [
 ]
 
 
-def find_cheapest_region(instance_type: str) -> tuple[str, float]:
-    """Query spot prices across candidate regions, return (cheapest_region, price).
+_AUTH_ERROR_CODES = {
+    "AuthFailure", "UnauthorizedOperation",
+    "InvalidClientTokenId", "ExpiredToken",
+}
+
+CAPACITY_ERROR_CODES = {
+    "InsufficientInstanceCapacity",
+    "InstanceLimitExceeded",
+    "MaxSpotInstanceCountExceeded",
+    "SpotMaxPriceTooLow",
+}
+
+
+def is_capacity_error(error: ClientError) -> bool:
+    """Check if a ClientError is a spot capacity issue (retryable with fallback)."""
+    return error.response["Error"]["Code"] in CAPACITY_ERROR_CODES
+
+
+def find_ranked_regions(
+    instance_type: str,
+    exclude: list[str] | None = None,
+    quiet: bool = False,
+) -> list[tuple[str, float]]:
+    """Query spot prices across candidate regions, return all with pricing.
+
+    Returns list of (region, price) sorted cheapest first.
+    Skips regions in the exclude list.
 
     Raises RuntimeError if no pricing data is available in any region.
     """
-    best_region: str | None = None
-    best_price = float("inf")
+    exclude_set = set(exclude or [])
+    results: list[tuple[str, float]] = []
 
-    with console.status("Checking spot prices across regions..."):
+    ctx = console.status("Checking spot prices across regions...") if not quiet else _nullcontext()
+    with ctx:
         for region in CANDIDATE_REGIONS:
+            if region in exclude_set:
+                continue
             try:
                 client = boto3.client("ec2", region_name=region)
                 resp = client.describe_spot_price_history(
@@ -48,30 +83,42 @@ def find_cheapest_region(instance_type: str) -> tuple[str, float]:
                     ProductDescriptions=["Linux/UNIX"],
                     MaxResults=20,
                 )
+                best_price = float("inf")
                 for entry in resp.get("SpotPriceHistory", []):
                     price = float(entry["SpotPrice"])
                     if price < best_price:
                         best_price = price
-                        best_region = region
+                if best_price < float("inf"):
+                    results.append((region, best_price))
             except ClientError as e:
                 code = e.response["Error"]["Code"]
-                if code in (
-                    "AuthFailure", "UnauthorizedOperation",
-                    "InvalidClientTokenId", "ExpiredToken",
-                ):
+                if code in _AUTH_ERROR_CODES:
                     raise
                 continue
 
-    if best_region is None:
+    if not results:
         raise RuntimeError(
             f"Could not find spot pricing for {instance_type} in any region."
         )
 
-    console.print(
-        f"Cheapest region: [bold]{best_region}[/bold] "
-        f"([green]${best_price:.4f}/hr[/green] for {instance_type})"
-    )
-    return best_region, best_price
+    results.sort(key=lambda x: x[1])
+
+    if not quiet:
+        best_region, best_price = results[0]
+        console.print(
+            f"Cheapest region: [bold]{best_region}[/bold] "
+            f"([green]${best_price:.4f}/hr[/green] for {instance_type})"
+        )
+
+    return results
+
+
+def find_cheapest_region(instance_type: str) -> tuple[str, float]:
+    """Query spot prices across candidate regions, return (cheapest_region, price).
+
+    Raises RuntimeError if no pricing data is available in any region.
+    """
+    return find_ranked_regions(instance_type)[0]
 
 
 class EC2Manager:
@@ -145,25 +192,35 @@ class EC2Manager:
                 raise
 
         console.print(f"Creating security group [bold]{sg_name}[/bold]")
-        resp = self.client.create_security_group(
-            GroupName=sg_name,
-            Description=f"SSH access for {project_tag}",
-        )
-        sg_id = resp["GroupId"]
-        self.client.authorize_security_group_ingress(
-            GroupId=sg_id,
-            IpPermissions=[{
-                "IpProtocol": "tcp",
-                "FromPort": 22,
-                "ToPort": 22,
-                "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH"}],
-            }],
-        )
-        self.client.create_tags(
-            Resources=[sg_id],
-            Tags=[{"Key": "Project", "Value": project_tag}],
-        )
-        return sg_id
+        try:
+            resp = self.client.create_security_group(
+                GroupName=sg_name,
+                Description=f"SSH access for {project_tag}",
+            )
+            sg_id = resp["GroupId"]
+            self.client.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH"}],
+                }],
+            )
+            self.client.create_tags(
+                Resources=[sg_id],
+                Tags=[{"Key": "Project", "Value": project_tag}],
+            )
+            return sg_id
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidGroup.Duplicate":
+                # Race: another thread created it — re-fetch
+                resp = self.client.describe_security_groups(
+                    Filters=[{"Name": "group-name", "Values": [sg_name]}]
+                )
+                if resp["SecurityGroups"]:
+                    return resp["SecurityGroups"][0]["GroupId"]
+            raise
 
     def get_spot_prices(self, instance_types: list[str]) -> dict[str, float]:
         """Get current spot prices, returning cheapest per instance type."""

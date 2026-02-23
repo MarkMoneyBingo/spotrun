@@ -1,5 +1,9 @@
 """Instance selection and cost estimation."""
 
+import logging
+
+_logger = logging.getLogger(__name__)
+
 # (instance_type, vcpus, arch)
 COMPUTE_INSTANCES: list[tuple[str, int, str]] = [
     # 4 vCPU
@@ -39,22 +43,20 @@ def _vcpus_needed(workers: int, arch: str) -> int:
     return workers * 2 + 1
 
 
-def select_instance(
+def select_ranked_instances(
     workers: int,
     prices: dict[str, float] | None = None,
     include_arm: bool = False,
-) -> tuple[str, int]:
-    """Pick the cheapest instance with enough vCPUs for the requested workers.
+) -> list[tuple[str, int]]:
+    """Return all candidate instances ranked by price (cheapest first).
 
     Args:
         workers: Number of parallel workers needed.
         prices: Optional dict of instance_type -> spot_price. When provided,
-            selects the cheapest priced candidate.
-        include_arm: If True, include ARM/Graviton instances. ARM instances
-            are typically 20-40% cheaper but may have compatibility issues
-            with some software. Default False (x86_64 only).
+            sorts candidates by price. Without prices, sorts by vCPU count.
+        include_arm: If True, include ARM/Graviton instances.
 
-    Returns (instance_type, vcpus).
+    Returns list of (instance_type, vcpus).
     """
     if workers < 1:
         raise ValueError(f"workers must be >= 1, got {workers}")
@@ -75,11 +77,36 @@ def select_instance(
         priced = [(it, vc, prices[it]) for it, vc in candidates if it in prices]
         if priced:
             priced.sort(key=lambda x: x[2])
-            return priced[0][0], priced[0][1]
+            return [(it, vc) for it, vc, _ in priced]
+        _logger.warning(
+            "Spot prices provided but no candidates have pricing data; "
+            "falling back to vCPU-sorted selection"
+        )
 
-    # Without prices, return the smallest candidate
+    # Without prices, sort by vCPU count (smallest first)
     candidates.sort(key=lambda x: x[1])
-    return candidates[0][0], candidates[0][1]
+    return candidates
+
+
+def select_instance(
+    workers: int,
+    prices: dict[str, float] | None = None,
+    include_arm: bool = False,
+) -> tuple[str, int]:
+    """Pick the cheapest instance with enough vCPUs for the requested workers.
+
+    Args:
+        workers: Number of parallel workers needed.
+        prices: Optional dict of instance_type -> spot_price. When provided,
+            selects the cheapest priced candidate.
+        include_arm: If True, include ARM/Graviton instances. ARM instances
+            are typically 20-40% cheaper but may have compatibility issues
+            with some software. Default False (x86_64 only).
+
+    Returns (instance_type, vcpus).
+    """
+    ranked = select_ranked_instances(workers, prices=prices, include_arm=include_arm)
+    return ranked[0]
 
 
 def instance_arch(instance_type: str) -> str:

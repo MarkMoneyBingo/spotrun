@@ -8,13 +8,20 @@ import stat
 import subprocess
 from pathlib import Path
 
+from botocore.exceptions import ClientError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from spotrun.ami import AMIManager
-from spotrun.ec2 import EC2Manager, find_cheapest_region
-from spotrun.pricing import all_instance_types, select_instance
+from spotrun.ec2 import EC2Manager, find_cheapest_region, find_ranked_regions, is_capacity_error
+from spotrun.exceptions import SpotCapacityError
+from spotrun.pricing import (
+    all_instance_types,
+    instance_arch,
+    select_instance,
+    select_ranked_instances,
+)
 from spotrun.sync import DataSync
 
 console = Console()
@@ -35,6 +42,7 @@ class Session:
         no_hyperthreading: bool = False,
         save_state: bool = True,
         auto_install: bool = True,
+        quiet: bool = False,
     ) -> None:
         self.workers = workers
         self.project_tag = project_tag
@@ -44,12 +52,22 @@ class Session:
         self.include_arm = include_arm
         self.no_hyperthreading = no_hyperthreading
         self.auto_install = auto_install
+        self._quiet = quiet
         self.last_output: str = ""
 
+        # Track whether region was explicitly specified (disables region fallback)
+        self._region_explicit = region is not None or "AWS_REGION" in os.environ
+
+        # Launch metadata (populated after successful launch)
+        self.instance_type: str | None = None
+        self.vcpus: int | None = None
+        self.spot_price: float | None = None
+        self.fallback_log: list[str] = []
+
         # Auto-select cheapest region if none specified
-        if region is None and "AWS_REGION" not in os.environ:
-            instance_type, _ = select_instance(workers, include_arm=include_arm)
-            region, _ = find_cheapest_region(instance_type)
+        if not self._region_explicit:
+            it, _ = select_instance(workers, include_arm=include_arm)
+            region, _ = find_cheapest_region(it)
 
         self.ec2 = EC2Manager(region=region)
         self.ami_mgr = AMIManager(self.ec2)
@@ -58,11 +76,17 @@ class Session:
         self._ip: str | None = None
         self._pem_path: str | None = None
 
+    def _print(self, *args, **kwargs) -> None:
+        """Print only when not in quiet mode."""
+        if not self._quiet:
+            console.print(*args, **kwargs)
+
     def launch(
         self,
         bootstrap_script: str | None = None,
         requirements_file: str | None = None,
         idle_timeout: int = 300,
+        fallback: bool = True,
     ) -> str:
         """Provision infrastructure and launch a spot instance. Returns public IP.
 
@@ -70,32 +94,153 @@ class Session:
             bootstrap_script: Path to a shell script to run during AMI build.
             requirements_file: Path to requirements.txt to pre-install in AMI.
             idle_timeout: Seconds of inactivity before auto-terminating the
-                instance.  Inactivity means no active SSH connections (including
-                non-PTY / quiet-mode sessions).  Defaults to 300 (5 minutes).
-                Set to 0 to disable.
+                instance.  Defaults to 300 (5 minutes). Set to 0 to disable.
+            fallback: If True (default), try alternative instance types and
+                regions on capacity errors. If False, raise SpotCapacityError
+                on the first capacity failure.
         """
         bootstrap_script = bootstrap_script or self.bootstrap_script
         requirements_file = requirements_file or self.requirements_file
 
-        from spotrun.pricing import instance_arch
+        if fallback:
+            return self._launch_with_fallback(
+                bootstrap_script, requirements_file, idle_timeout,
+            )
+        else:
+            return self._launch_single(
+                bootstrap_script, requirements_file, idle_timeout,
+            )
 
-        # 1. Ensure infra
+    def _launch_single(
+        self,
+        bootstrap_script: str | None,
+        requirements_file: str | None,
+        idle_timeout: int,
+    ) -> str:
+        """Launch with no fallback — raise SpotCapacityError on capacity error."""
         key_name, pem_path, sg_id = self.ec2.ensure_infra(self.project_tag)
         self._pem_path = pem_path
 
-        # 2. Spot prices and instance selection (cheapest that fits)
         prices = self.ec2.get_spot_prices(all_instance_types(include_arm=self.include_arm))
-        instance_type, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
-        arch = instance_arch(instance_type)
-        spot_price = prices.get(instance_type)
-        self._show_pricing(instance_type, vcpus, spot_price, prices)
+        itype, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
+        arch = instance_arch(itype)
+        spot_price = prices.get(itype)
+        self._show_pricing(itype, vcpus, spot_price, prices)
 
-        # 3. Find or create AMI (must match selected architecture)
+        try:
+            return self._do_launch_instance(
+                itype, vcpus, arch, spot_price, key_name, pem_path, sg_id,
+                bootstrap_script, requirements_file, idle_timeout,
+            )
+        except ClientError as e:
+            if is_capacity_error(e):
+                err_msg = e.response["Error"]["Message"]
+                self.fallback_log.append(
+                    f"{self.ec2.region}/{itype}: {err_msg}"
+                )
+                raise SpotCapacityError(
+                    f"No spot capacity for {itype} in {self.ec2.region}: {err_msg}",
+                    attempts=[(self.ec2.region, itype, err_msg)],
+                )
+            raise
+
+    def _launch_with_fallback(
+        self,
+        bootstrap_script: str | None,
+        requirements_file: str | None,
+        idle_timeout: int,
+    ) -> str:
+        """Launch with instance type + region fallback on capacity errors."""
+        attempts: list[tuple[str, str, str]] = []
+
+        # Build the list of regions to try
+        # Current region first, then others (if region was auto-selected)
+        regions_to_try = [self.ec2.region]
+        if not self._region_explicit:
+            # Get other regions sorted by price for the smallest candidate
+            try:
+                smallest_type, _ = select_instance(
+                    self.workers, include_arm=self.include_arm,
+                )
+                ranked = find_ranked_regions(
+                    smallest_type, exclude=[self.ec2.region], quiet=self._quiet,
+                )
+                regions_to_try.extend(r for r, _ in ranked)
+            except (RuntimeError, ValueError):
+                pass  # No other regions available
+
+        for region in regions_to_try:
+            # Switch region if needed
+            if region != self.ec2.region:
+                self._switch_region(region)
+                self.fallback_log.append(f"Trying region {region}...")
+                self._print(f"[yellow]Trying region {region}...[/yellow]")
+
+            key_name, pem_path, sg_id = self.ec2.ensure_infra(self.project_tag)
+            self._pem_path = pem_path
+
+            prices = self.ec2.get_spot_prices(
+                all_instance_types(include_arm=self.include_arm),
+            )
+            ranked_instances = select_ranked_instances(
+                self.workers, prices=prices, include_arm=self.include_arm,
+            )
+            if not self._quiet and region == regions_to_try[0]:
+                # Show pricing table only for the first region
+                itype0, vcpus0 = ranked_instances[0]
+                self._show_pricing(itype0, vcpus0, prices.get(itype0), prices)
+
+            for itype, vcpus in ranked_instances:
+                arch = instance_arch(itype)
+                spot_price = prices.get(itype)
+                try:
+                    return self._do_launch_instance(
+                        itype, vcpus, arch, spot_price, key_name, pem_path, sg_id,
+                        bootstrap_script, requirements_file, idle_timeout,
+                    )
+                except ClientError as e:
+                    if is_capacity_error(e):
+                        err_msg = e.response["Error"]["Message"]
+                        attempts.append((region, itype, err_msg))
+                        self.fallback_log.append(
+                            f"{region}/{itype}: {err_msg}"
+                        )
+                        self._print(
+                            f"[yellow]{itype} unavailable in {region}: "
+                            f"{err_msg}[/yellow]"
+                        )
+                        continue
+                    raise
+
+        # All options exhausted
+        raise SpotCapacityError(
+            f"No spot capacity available after trying {len(attempts)} options.",
+            attempts=attempts,
+        )
+
+    def _do_launch_instance(
+        self,
+        itype: str,
+        vcpus: int,
+        arch: str,
+        spot_price: float | None,
+        key_name: str,
+        pem_path: str,
+        sg_id: str,
+        bootstrap_script: str | None,
+        requirements_file: str | None,
+        idle_timeout: int,
+    ) -> str:
+        """Try to launch a single instance type. Returns public IP.
+
+        Raises ClientError on capacity issues (caller handles fallback).
+        """
+        # Find or create AMI (must match selected architecture)
         ami_id = self.ami_mgr.find_existing(self.project_tag, arch=arch)
         if ami_id:
-            console.print(f"Using existing AMI: [bold]{ami_id}[/bold] ({arch})")
+            self._print(f"Using existing AMI: [bold]{ami_id}[/bold] ({arch})")
         else:
-            console.print(f"No existing AMI found for {arch}, building one...")
+            self._print(f"No existing AMI found for {arch}, building one...")
             ami_id = self.ami_mgr.create(
                 key_name, pem_path, sg_id,
                 bootstrap_script=bootstrap_script,
@@ -104,17 +249,17 @@ class Session:
                 arch=arch,
             )
 
-        # 5. Request spot instance
-        # Graviton/ARM has no hyperthreading — skip CpuOptions for ARM
+        # CPU options: disable hyperthreading for x86
         if self.no_hyperthreading and arch != "arm64":
             threads_per_core = 1
-            core_count = vcpus // 2  # x86: 2 threads per core by default
+            core_count = vcpus // 2
         else:
             threads_per_core = None
             core_count = None
-        with console.status(f"Requesting [bold]{instance_type}[/bold] spot instance..."):
+
+        if self._quiet:
             self._instance_id = self.ec2.request_spot_instance(
-                instance_type=instance_type,
+                instance_type=itype,
                 ami_id=ami_id,
                 key_name=key_name,
                 sg_id=sg_id,
@@ -122,37 +267,65 @@ class Session:
                 threads_per_core=threads_per_core,
                 core_count=core_count,
             )
-            console.print(f"Instance: [bold]{self._instance_id}[/bold]")
+        else:
+            with console.status(f"Requesting [bold]{itype}[/bold] spot instance..."):
+                self._instance_id = self.ec2.request_spot_instance(
+                    instance_type=itype,
+                    ami_id=ami_id,
+                    key_name=key_name,
+                    sg_id=sg_id,
+                    project_tag=self.project_tag,
+                    threads_per_core=threads_per_core,
+                    core_count=core_count,
+                )
+                console.print(f"Instance: [bold]{self._instance_id}[/bold]")
 
-        # Save state early so `spotrun teardown` can find orphaned instances
+        # Save state early
         self._save_state(key_name, sg_id)
 
-        # 6. Wait for running + SSH (clean up instance on failure)
+        # Wait for running + SSH
         try:
-            with console.status("Waiting for instance to start..."):
+            if self._quiet:
                 self._ip = self.ec2.wait_for_running(self._instance_id)
-                console.print(f"Public IP: [bold]{self._ip}[/bold]")
+            else:
+                with console.status("Waiting for instance to start..."):
+                    self._ip = self.ec2.wait_for_running(self._instance_id)
+                    console.print(f"Public IP: [bold]{self._ip}[/bold]")
 
-            with console.status("Waiting for SSH..."):
+                with console.status("Waiting for SSH..."):
+                    self.ec2.wait_for_ssh(self._ip)
+
+            if self._quiet:
                 self.ec2.wait_for_ssh(self._ip)
         except Exception:
             try:
                 self.teardown()
             except Exception:
-                pass  # Original exception takes priority
+                pass
             raise
 
         self._sync = DataSync(self._ip, pem_path)
-
-        # Update state with IP now that instance is running
         self._save_state(key_name, sg_id)
 
-        # Install idle watchdog (on by default — shuts down after inactivity)
         if idle_timeout and idle_timeout > 0:
             self._install_idle_watchdog(idle_timeout)
 
-        console.print("[green bold]Instance ready.[/green bold]")
+        # Store launch metadata
+        self.instance_type = itype
+        self.vcpus = vcpus
+        self.spot_price = spot_price
+
+        self._print("[green bold]Instance ready.[/green bold]")
         return self._ip
+
+    def _switch_region(self, region: str) -> None:
+        """Switch to a different AWS region."""
+        self.ec2 = EC2Manager(region=region)
+        self.ami_mgr = AMIManager(self.ec2)
+        self._instance_id = None
+        self._ip = None
+        self._sync = None
+        self._pem_path = None
 
     def sync(self, paths: list[str], remote_base: str = "/opt/project",
              quiet: bool = False) -> None:
@@ -205,7 +378,7 @@ class Session:
         try:
             result = self._sync.ssh_run(detect_cmd, capture=True)
         except subprocess.CalledProcessError:
-            console.print("[yellow]Warning: could not detect dependency files[/yellow]")
+            self._print("[yellow]Warning: could not detect dependency files[/yellow]")
             return False
         if not isinstance(result, str):
             return False
@@ -218,10 +391,10 @@ class Session:
         venv_python = f"{remote_root}/.venv/bin/python"
 
         if deps_type == "requirements":
-            console.print("[dim]Installing dependencies from requirements.txt...[/dim]")
+            self._print("[dim]Installing dependencies from requirements.txt...[/dim]")
             install_cmd = f"{venv_pip} install --quiet -r {remote_root}/requirements.txt"
         elif deps_type == "pyproject":
-            console.print("[dim]Installing dependencies from pyproject.toml...[/dim]")
+            self._print("[dim]Installing dependencies from pyproject.toml...[/dim]")
             install_cmd = (
                 f"{venv_python} << 'PYEOF'\n"
                 "import subprocess, sys\n"
@@ -246,7 +419,7 @@ class Session:
         if not isinstance(exit_code, int):
             exit_code = -1
         if exit_code != 0:
-            console.print("[yellow]Warning: dependency installation returned non-zero exit code[/yellow]")
+            self._print("[yellow]Warning: dependency installation returned non-zero exit code[/yellow]")
         return True
 
     def run(self, command: str, quiet: bool = False, stop_event=None,
@@ -300,10 +473,10 @@ class Session:
     def get_pricing_info(self) -> dict:
         """Return pricing info without launching anything."""
         prices = self.ec2.get_spot_prices(all_instance_types(include_arm=self.include_arm))
-        instance_type, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
-        spot_price = prices.get(instance_type)
+        itype, vcpus = select_instance(self.workers, prices=prices, include_arm=self.include_arm)
+        spot_price = prices.get(itype)
         return {
-            "instance_type": instance_type,
+            "instance_type": itype,
             "vcpus": vcpus,
             "spot_price": spot_price,
             "all_prices": prices,
@@ -347,6 +520,8 @@ class Session:
         spot_price: float | None,
         all_prices: dict[str, float],
     ) -> None:
+        if self._quiet:
+            return
         table = Table(title="Spot Prices", show_header=True)
         table.add_column("Instance", style="cyan")
         table.add_column("vCPUs", justify="right")
