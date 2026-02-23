@@ -14,7 +14,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from spotrun.ami import AMIManager
-from spotrun.ec2 import EC2Manager, find_cheapest_region, find_ranked_regions, is_capacity_error
+from spotrun.ec2 import (
+    _AUTH_ERROR_CODES,
+    CANDIDATE_REGIONS,
+    EC2Manager,
+    find_cheapest_region,
+    is_capacity_error,
+)
 from spotrun.exceptions import SpotCapacityError
 from spotrun.pricing import (
     all_instance_types,
@@ -153,67 +159,114 @@ class Session:
         requirements_file: str | None,
         idle_timeout: int,
     ) -> str:
-        """Launch with instance type + region fallback on capacity errors."""
+        """Launch with global instance type + region fallback on capacity errors.
+
+        Builds a single flat list of (region, instance_type) candidates sorted
+        by spot price across ALL candidate regions, then tries each in order.
+        This ensures we always pick the next globally cheapest option rather
+        than exhausting all instance types in one region before moving on.
+        """
         attempts: list[tuple[str, str, str]] = []
+        all_itypes = all_instance_types(include_arm=self.include_arm)
 
-        # Build the list of regions to try
-        # Current region first, then others (if region was auto-selected)
-        regions_to_try = [self.ec2.region]
-        if not self._region_explicit:
-            # Get other regions sorted by price for the smallest candidate
+        # Determine regions to query
+        if self._region_explicit:
+            regions = [self.ec2.region]
+        else:
+            regions = [self.ec2.region]
+            for r in CANDIDATE_REGIONS:
+                if r not in regions:
+                    regions.append(r)
+
+        # Fetch prices from all regions and build globally ranked list
+        # Each entry: (price, region, instance_type, vcpus)
+        global_candidates: list[tuple[float, str, str, int]] = []
+        region_prices: dict[str, dict[str, float]] = {}
+
+        if len(regions) > 1:
+            self._print("[dim]Querying spot prices across regions...[/dim]")
+
+        for region in regions:
             try:
-                smallest_type, _ = select_instance(
-                    self.workers, include_arm=self.include_arm,
-                )
-                ranked = find_ranked_regions(
-                    smallest_type, exclude=[self.ec2.region], quiet=self._quiet,
-                )
-                regions_to_try.extend(r for r, _ in ranked)
-            except (RuntimeError, ValueError):
-                pass  # No other regions available
+                mgr = self.ec2 if region == self.ec2.region else EC2Manager(region=region)
+                prices = mgr.get_spot_prices(all_itypes)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in _AUTH_ERROR_CODES:
+                    raise
+                self.fallback_log.append(f"Could not query prices in {region}")
+                continue
 
-        for region in regions_to_try:
+            region_prices[region] = prices
+            try:
+                ranked = select_ranked_instances(
+                    self.workers, prices=prices, include_arm=self.include_arm,
+                )
+            except ValueError:
+                continue
+
+            for itype, vcpus in ranked:
+                price = prices.get(itype)
+                if price is not None:
+                    global_candidates.append((price, region, itype, vcpus))
+
+        if not global_candidates:
+            raise SpotCapacityError(
+                "Could not find spot pricing in any region.",
+                attempts=[],
+            )
+
+        # Sort by price — globally cheapest first
+        global_candidates.sort(key=lambda x: x[0])
+
+        # Show pricing table for the cheapest candidate's region
+        if not self._quiet:
+            price0, region0, itype0, vcpus0 = global_candidates[0]
+            best_prices = region_prices.get(region0, {})
+            self._show_pricing(itype0, vcpus0, price0, best_prices)
+
+        # Lazy infra setup per region
+        region_infra: dict[str, tuple[str, str, str]] = {}
+
+        for i, (price, region, itype, vcpus) in enumerate(global_candidates):
             # Switch region if needed
             if region != self.ec2.region:
                 self._switch_region(region)
-                self.fallback_log.append(f"Trying region {region}...")
-                self._print(f"[yellow]Trying region {region}...[/yellow]")
 
-            key_name, pem_path, sg_id = self.ec2.ensure_infra(self.project_tag)
-            self._pem_path = pem_path
+            if i > 0:
+                self.fallback_log.append(
+                    f"Trying {itype} in {region} (${price:.4f}/hr)..."
+                )
+                self._print(
+                    f"[yellow]Trying {itype} in {region} "
+                    f"(${price:.4f}/hr)...[/yellow]"
+                )
 
-            prices = self.ec2.get_spot_prices(
-                all_instance_types(include_arm=self.include_arm),
-            )
-            ranked_instances = select_ranked_instances(
-                self.workers, prices=prices, include_arm=self.include_arm,
-            )
-            if not self._quiet and region == regions_to_try[0]:
-                # Show pricing table only for the first region
-                itype0, vcpus0 = ranked_instances[0]
-                self._show_pricing(itype0, vcpus0, prices.get(itype0), prices)
+            # Ensure infra once per region
+            if region not in region_infra:
+                key_name, pem_path, sg_id = self.ec2.ensure_infra(self.project_tag)
+                self._pem_path = pem_path
+                region_infra[region] = (key_name, pem_path, sg_id)
+            else:
+                key_name, pem_path, sg_id = region_infra[region]
+                self._pem_path = pem_path
 
-            for itype, vcpus in ranked_instances:
-                arch = instance_arch(itype)
-                spot_price = prices.get(itype)
-                try:
-                    return self._do_launch_instance(
-                        itype, vcpus, arch, spot_price, key_name, pem_path, sg_id,
-                        bootstrap_script, requirements_file, idle_timeout,
+            arch = instance_arch(itype)
+            try:
+                return self._do_launch_instance(
+                    itype, vcpus, arch, price, key_name, pem_path, sg_id,
+                    bootstrap_script, requirements_file, idle_timeout,
+                )
+            except ClientError as e:
+                if is_capacity_error(e):
+                    err_msg = e.response["Error"]["Message"]
+                    attempts.append((region, itype, err_msg))
+                    self.fallback_log.append(f"{region}/{itype}: {err_msg}")
+                    self._print(
+                        f"[yellow]{itype} unavailable in {region}: "
+                        f"{err_msg}[/yellow]"
                     )
-                except ClientError as e:
-                    if is_capacity_error(e):
-                        err_msg = e.response["Error"]["Message"]
-                        attempts.append((region, itype, err_msg))
-                        self.fallback_log.append(
-                            f"{region}/{itype}: {err_msg}"
-                        )
-                        self._print(
-                            f"[yellow]{itype} unavailable in {region}: "
-                            f"{err_msg}[/yellow]"
-                        )
-                        continue
-                    raise
+                    continue
+                raise
 
         # All options exhausted
         raise SpotCapacityError(
